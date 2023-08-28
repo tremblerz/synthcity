@@ -17,6 +17,7 @@ from tsai.models.TCN import TCN
 from tsai.models.TransformerModel import TransformerModel
 from tsai.models.XceptionTime import XceptionTime
 from tsai.models.XCM import XCM
+from opacus.layers import DPRNN, DPLSTM
 
 # synthcity absolute
 import synthcity.logger as log
@@ -31,6 +32,8 @@ modes = [
     "LSTM",
     "GRU",
     "RNN",
+    "DPRNN",
+    "DPLSTM",
     "Transformer",
     "MLSTM_FCN",
     "TCN",
@@ -570,11 +573,13 @@ class TimeSeriesLayer(nn.Module):
         }
         temporal_models = {
             "RNN": nn.RNN,
+            "DPRNN": DPRNN,
             "LSTM": nn.LSTM,
+            "DPLSTM": DPLSTM,
             "GRU": nn.GRU,
         }
 
-        if mode in ["RNN", "LSTM", "GRU"]:
+        if mode in ["RNN", "LSTM", "GRU", "DPRNN", "DPLSTM"]:
             self.temporal_layer = temporal_models[mode](**temporal_params)
         elif mode == "MLSTM_FCN":
             self.temporal_layer = MLSTM_FCN(
@@ -642,7 +647,7 @@ class TimeSeriesLayer(nn.Module):
         self.device = device
         self.mode = mode
 
-        if mode in ["RNN", "LSTM", "GRU"]:
+        if mode in ["RNN", "LSTM", "GRU", "DPRNN", "DPLSTM"]:
             self.out = WindowLinearLayer(
                 n_static_units_in=n_static_units_in,
                 n_temporal_units_in=n_temporal_units_hidden,
@@ -671,7 +676,7 @@ class TimeSeriesLayer(nn.Module):
     def forward(
         self, static_data: torch.Tensor, temporal_data: torch.Tensor
     ) -> torch.Tensor:
-        if self.mode in ["RNN", "LSTM", "GRU"]:
+        if self.mode in ["RNN", "LSTM", "GRU", "DPRNN", "DPLSTM"]:
             X_interm, _ = self.temporal_layer(temporal_data)
 
             if torch.isnan(X_interm).sum() != 0:

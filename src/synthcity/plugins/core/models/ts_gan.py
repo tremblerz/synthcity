@@ -3,6 +3,8 @@ from typing import Any, Callable, List, Optional, Tuple
 
 # third party
 import numpy as np
+from opacus import PrivacyEngine
+from opacus.utils.module_utils import trainable_parameters
 import torch
 from pydantic import validate_arguments
 from torch import nn
@@ -18,6 +20,15 @@ from synthcity.utils.reproducibility import enable_reproducible_results
 from .mlp import MLP
 from .ts_model import TimeSeriesModel
 
+
+def promote_current_grad_sample(p: nn.Parameter) -> None:
+    if p.requires_grad:
+        if p.grad_sample is not None:
+            pass
+        else:
+            p.grad_sample = p._current_grad_sample
+        p._forward_counter = 0
+        del p._current_grad_sample
 
 class TimeSeriesGAN(nn.Module):
     """
@@ -152,6 +163,12 @@ class TimeSeriesGAN(nn.Module):
         mode: str = "RNN",
         device: Any = DEVICE,
         use_horizon_condition: bool = True,
+        # privacy settings
+        dp_enabled: bool = False,
+        dp_delta: Optional[float] = None,
+        dp_epsilon: float = 3,
+        dp_max_grad_norm: float = 2,
+        dp_secure_mode: bool = False,
     ) -> None:
         super(TimeSeriesGAN, self).__init__()
 
@@ -317,6 +334,12 @@ class TimeSeriesGAN(nn.Module):
         self.random_state = random_state
 
         self.dataloader_sampler = dataloader_sampler
+
+        self.dp_enabled = dp_enabled
+        self.dp_delta = dp_delta
+        self.dp_epsilon = dp_epsilon
+        self.dp_max_grad_norm = dp_max_grad_norm
+        self.dp_secure_mode = dp_secure_mode
 
     def fit(
         self,
@@ -610,6 +633,17 @@ class TimeSeriesGAN(nn.Module):
         # Calculate gradients for G
         errE.backward()
 
+        if self.dp_enabled:
+            # for _, p in trainable_parameters(self.temporal_embedder):
+            #     promote_current_grad_sample(p)
+            # print('temporal_embedder', )
+            for _, p in trainable_parameters(self.temporal_recovery):
+                promote_current_grad_sample(p)
+            # print('temporal_recovery', )
+            for _, p in trainable_parameters(self.temporal_supervisor):
+                promote_current_grad_sample(p)
+            # print('temporal_supervisor', )
+
         # Update G
         for model in train_models:
             if self.clipping_value > 0:
@@ -693,6 +727,11 @@ class TimeSeriesGAN(nn.Module):
         # Calculate gradients for G
         G_loss.backward()
 
+        if self.dp_enabled:
+            for _, p in trainable_parameters(self.temporal_recovery):
+                promote_current_grad_sample(p)
+            for _, p in trainable_parameters(self.temporal_supervisor):
+                promote_current_grad_sample(p)
         # Update G
         for model in train_models:
             if self.clipping_value > 0:
@@ -741,15 +780,35 @@ class TimeSeriesGAN(nn.Module):
         errD_horizon_fake = self.criterion(horizons_d_fake, fake_labels)
         errD_horizon_real = self.criterion(horizons_d_real, real_labels)
 
-        errD = (
-            errD_real
-            + errD_fake
-            + errD_horizon_fake
-            + errD_horizon_real
-            + self.gamma_penalty * errD_fake_e
-        )
-
-        errD.backward()
+        if self.dp_enabled:
+            errD = (
+                errD_fake
+                + errD_horizon_fake
+                + errD_horizon_real
+                + self.gamma_penalty * errD_fake_e
+            )
+            self.discriminator.disable_hooks()
+            errD.backward(retain_graph=True)
+            self.discriminator.enable_hooks()
+            errD_real.backward()
+            # Adjustment to the gradients because opacus is not working
+            for _, p in trainable_parameters(self.discriminator):
+                promote_current_grad_sample(p)
+            # for module in self.discriminator.modules():
+            #     if hasattr(module, "activations"):
+            #         # print(len(module.activations))
+            #         module.activations = []
+            # if hasattr(module, "max_batch_len"):
+            #     del module.max_batch_len
+        else:
+            errD = (
+                errD_real
+                + errD_fake
+                + errD_horizon_fake
+                + errD_horizon_real
+                + self.gamma_penalty * errD_fake_e
+            )
+            errD.backward()
         # Update D
         for model in train_models:
             if self.clipping_value > 0:
@@ -767,7 +826,35 @@ class TimeSeriesGAN(nn.Module):
         E_losses = []
         G_losses = []
         D_losses = []
-
+        # self.privacy_engine = PrivacyEngine()
+        # self.temporal_embedder, self.temporal_embedder.optimizer, loader = self.privacy_engine.make_private(
+        #     module=self.temporal_embedder,
+        #     optimizer=self.temporal_embedder.optimizer,
+        #     data_loader=loader,
+        #     noise_multiplier=1.1,
+        #     max_grad_norm=1.0,
+        # )
+        # self.temporal_recovery, self.temporal_recovery.optimizer, loader = self.privacy_engine.make_private(
+        #     module=self.temporal_recovery,
+        #     optimizer=self.temporal_recovery.optimizer,
+        #     data_loader=loader,
+        #     noise_multiplier=1.1,
+        #     max_grad_norm=1.0,
+        # )
+        # self.temporal_supervisor, self.temporal_supervisor.optimizer, loader = self.privacy_engine.make_private(
+        #     module=self.temporal_supervisor,
+        #     optimizer=self.temporal_supervisor.optimizer,
+        #     data_loader=loader,
+        #     noise_multiplier=1.1,
+        #     max_grad_norm=1.0,
+        # )
+        # self.discriminator, self.discriminator.optimizer, loader = self.privacy_engine.make_private(
+        #     module=self.discriminator,
+        #     optimizer=self.discriminator.optimizer,
+        #     data_loader=loader,
+        #     noise_multiplier=1.1,
+        #     max_grad_norm=1.0,
+        # )
         for i, data in enumerate(loader):
             cond: Optional[torch.Tensor] = None
             if self.n_units_conditional > 0:
@@ -817,6 +904,69 @@ class TimeSeriesGAN(nn.Module):
         # Load Dataset
         loader = self.dataloader(static_data, temporal_data, observation_times, cond)
 
+        if self.dp_enabled:
+            if self.dp_delta is None:
+                self.dp_delta = 1 / len(static_data)
+
+            print('Enabling DP Privacy Engine: epsilon=', self.dp_epsilon, 'delta=', self.dp_delta, 'max_grad_norm=', self.dp_max_grad_norm, 'secure_mode=', self.dp_secure_mode,)
+            privacy_engine = PrivacyEngine(secure_mode=self.dp_secure_mode)
+            (
+                self.discriminator,
+                self.discriminator.optimizer,
+                loader,
+            ) = privacy_engine.make_private_with_epsilon(
+                    module=self.discriminator,
+                    optimizer=self.discriminator.optimizer,
+                    data_loader=loader,
+                    epochs=self.generator_n_iter,
+                    target_epsilon=self.dp_epsilon,
+                    target_delta=self.dp_delta,
+                    max_grad_norm=self.dp_max_grad_norm,
+                    poisson_sampling=False,
+            )
+            # (
+            #     self.temporal_embedder,
+            #     self.temporal_embedder.optimizer,
+            #     loader,
+            # ) = privacy_engine.make_private_with_epsilon(
+            #         module=self.temporal_embedder,
+            #         optimizer=self.temporal_embedder.optimizer,
+            #         data_loader=loader,
+            #         epochs=self.generator_n_iter,
+            #         target_epsilon=self.dp_epsilon,
+            #         target_delta=self.dp_delta,
+            #         max_grad_norm=self.dp_max_grad_norm,
+            #         poisson_sampling=False,
+            #     )
+            (
+                self.temporal_recovery,
+                self.temporal_recovery.optimizer,
+                loader,
+            ) = privacy_engine.make_private_with_epsilon(
+                    module=self.temporal_recovery,
+                    optimizer=self.temporal_recovery.optimizer,
+                    data_loader=loader,
+                    epochs=self.generator_n_iter,
+                    target_epsilon=self.dp_epsilon,
+                    target_delta=self.dp_delta,
+                    max_grad_norm=self.dp_max_grad_norm,
+                    poisson_sampling=False,
+                )
+            (
+                self.temporal_supervisor,
+                self.temporal_supervisor.optimizer,
+                loader,
+            ) = privacy_engine.make_private_with_epsilon(
+                    module=self.temporal_supervisor,
+                    optimizer=self.temporal_supervisor.optimizer,
+                    data_loader=loader,
+                    epochs=self.generator_n_iter,
+                    target_epsilon=self.dp_epsilon,
+                    target_delta=self.dp_delta,
+                    max_grad_norm=self.dp_max_grad_norm,
+                    poisson_sampling=False,
+                )
+            
         # Train loop
         for i in tqdm(range(self.generator_n_iter)):
             e_loss, g_loss, d_loss = self._train_epoch(

@@ -172,6 +172,12 @@ class TimeGANPlugin(Plugin):
         workspace: Path = Path("workspace"),
         compress_dataset: bool = False,
         sampling_patience: int = 500,
+        # privacy settings
+        dp_enabled: bool = False,
+        epsilon: float = 1,
+        delta: Optional[float] = None,
+        dp_max_grad_norm: float = 2,
+        dp_secure_mode: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -219,6 +225,13 @@ class TimeGANPlugin(Plugin):
         self.embedding_penalty = embedding_penalty
         self.use_horizon_condition = use_horizon_condition
         self.dataloader_sampling_strategy = dataloader_sampling_strategy
+
+        # privacy
+        self.dp_enabled = dp_enabled
+        self.dp_epsilon = epsilon
+        self.dp_delta = delta
+        self.dp_max_grad_norm = dp_max_grad_norm
+        self.dp_secure_mode = dp_secure_mode
 
         self.outcome_encoder = TabularEncoder(max_clusters=encoder_max_clusters)
 
@@ -332,6 +345,12 @@ class TimeGANPlugin(Plugin):
             embedding_penalty=self.embedding_penalty,
             use_horizon_condition=self.use_horizon_condition,
             dataloader_sampler=sampler,
+            # privacy
+            dp_enabled=self.dp_enabled,
+            dp_epsilon=self.dp_epsilon,
+            dp_delta=self.dp_delta,
+            dp_max_grad_norm=self.dp_max_grad_norm,
+            dp_secure_mode=self.dp_secure_mode,
         )
         self.cov_model.fit(static, temporal, observation_times, cond=cond)
 

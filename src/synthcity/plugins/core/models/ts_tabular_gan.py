@@ -151,6 +151,12 @@ class TimeSeriesTabularGAN(torch.nn.Module):
         moments_penalty: float = 100,
         embedding_penalty: float = 10,
         use_horizon_condition: bool = True,
+        # privacy settings
+        dp_enabled: bool = False,
+        dp_epsilon: float = 3,
+        dp_delta: Optional[float] = None,
+        dp_max_grad_norm: float = 2,
+        dp_secure_mode: bool = False,
     ) -> None:
         super(TimeSeriesTabularGAN, self).__init__()
         if encoder is not None:
@@ -208,6 +214,12 @@ class TimeSeriesTabularGAN(torch.nn.Module):
             moments_penalty=moments_penalty,
             embedding_penalty=embedding_penalty,
             use_horizon_condition=use_horizon_condition,
+            # privacy settings
+            dp_enabled=dp_enabled,
+            dp_epsilon=dp_epsilon,
+            dp_delta=dp_delta,
+            dp_max_grad_norm=dp_max_grad_norm,
+            dp_secure_mode=dp_secure_mode,
         )
 
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
