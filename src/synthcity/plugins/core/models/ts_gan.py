@@ -498,6 +498,10 @@ class TimeSeriesGAN(nn.Module):
         temporal_data: torch.Tensor,
         observation_times: torch.Tensor,
         cond: Optional[torch.Tensor],
+        discriminator_flag: bool = False,
+        embedder_flag: bool = False,
+        recovery_flag: bool = False,
+        supervisor_flag: bool = False,
     ) -> Tuple:
         batch_size = min(self.batch_size, len(static_data))
 
@@ -532,12 +536,21 @@ class TimeSeriesGAN(nn.Module):
         )
 
         # Embedder & Recovery
+        if self.dp_enabled and embedder_flag:
+            self.temporal_embedder.enable_hooks()
         temporal_embeddings = self.temporal_embedder(
             real_static_data, temporal_data, real_observation_times
         )
+        if self.dp_enabled and embedder_flag:
+            self.temporal_embedder.disable_hooks()
+
+        if self.dp_enabled and recovery_flag:
+            self.temporal_recovery.enable_hooks()
         recovered_temporal_data = self.temporal_recovery(
             real_static_data, temporal_embeddings, real_observation_times
         )
+        if self.dp_enabled and recovery_flag:
+            self.temporal_recovery.disable_hooks()
 
         # Generator
         temporal_latent_data = self.temporal_generator(
@@ -546,9 +559,19 @@ class TimeSeriesGAN(nn.Module):
         fake_next_temporal_embeddings = self.temporal_supervisor(
             fake_static_data, temporal_latent_data, fake_observation_times
         )
+        if self.dp_enabled and supervisor_flag:
+            self.temporal_supervisor.enable_hooks()
+        # for param in self.temporal_supervisor.parameters():
+        #     print('before forward pass', param._forward_counter)
+        #     break
         next_temporal_embeddings = self.temporal_supervisor(
             fake_static_data, temporal_embeddings, fake_observation_times
         )
+        if self.dp_enabled and supervisor_flag:
+            self.temporal_supervisor.disable_hooks()
+        # for param in self.temporal_supervisor.parameters():
+        #     print('after forward pass', param._forward_counter)
+        #     break
 
         # Synthetic data
         fake_temporal_data = self.temporal_recovery(
@@ -563,9 +586,13 @@ class TimeSeriesGAN(nn.Module):
             fake_next_temporal_embeddings,
             fake_observation_times,
         ).squeeze()
+        if self.dp_enabled and discriminator_flag:
+            self.discriminator.enable_hooks()
         outcome_real = self.discriminator(
             real_static_data, temporal_embeddings, real_observation_times
         ).squeeze()
+        if self.dp_enabled and discriminator_flag:
+            self.discriminator.disable_hooks()
         outcome_latent = self.discriminator(
             fake_static_data, temporal_latent_data, fake_observation_times
         ).squeeze()
@@ -608,17 +635,17 @@ class TimeSeriesGAN(nn.Module):
         (
             temporal_embeddings,
             recovered_temporal_data,
-            temporal_latent_data,
-            fake_next_temporal_embeddings,
+            _,
+            _,
             next_temporal_embeddings,
-            fake_temporal_data,
+            _,
             _,
             _,
             _,
             _,
             _,
         ) = self._train_epoch_all_models(
-            static_data, temporal_data, observation_times, cond
+            static_data, temporal_data, observation_times, cond, embedder_flag=True, recovery_flag=True, supervisor_flag=True
         )
 
         # Embedder network loss
@@ -631,18 +658,15 @@ class TimeSeriesGAN(nn.Module):
         errE = errE_rmse + 0.1 * errG_supervised
 
         # Calculate gradients for G
-        errE.backward()
-
         if self.dp_enabled:
-            # for _, p in trainable_parameters(self.temporal_embedder):
-            #     promote_current_grad_sample(p)
-            # print('temporal_embedder', )
-            for _, p in trainable_parameters(self.temporal_recovery):
-                promote_current_grad_sample(p)
-            # print('temporal_recovery', )
-            for _, p in trainable_parameters(self.temporal_supervisor):
-                promote_current_grad_sample(p)
-            # print('temporal_supervisor', )
+            self.temporal_embedder.enable_hooks()
+            self.temporal_recovery.enable_hooks()
+            self.temporal_supervisor.enable_hooks()
+        errE.backward()
+        if self.dp_enabled:
+            self.temporal_embedder.disable_hooks()
+            self.temporal_recovery.disable_hooks()
+            self.temporal_supervisor.disable_hooks()
 
         # Update G
         for model in train_models:
@@ -675,18 +699,18 @@ class TimeSeriesGAN(nn.Module):
 
         (
             temporal_embeddings,
-            recovered_temporal_data,
-            temporal_latent_data,
-            fake_next_temporal_embeddings,
+            _,
+            _,
+            _,
             next_temporal_embeddings,
             fake_temporal_data,
             outcome_fake,
-            outcome_real,
+            _,
             outcome_latent,
             horizons_d_fake,
-            horizons_d_real,
+            _,
         ) = self._train_epoch_all_models(
-            static_data, temporal_data, observation_times, cond
+            static_data, temporal_data, observation_times, cond, supervisor_flag=True
         )
 
         fake_labels = torch.ones(len(temporal_data)).to(self.device).squeeze()
@@ -724,15 +748,19 @@ class TimeSeriesGAN(nn.Module):
             + self.moments_penalty * errG_l1_moments
         )
 
+        if self.dp_enabled:
+            self.temporal_supervisor.enable_hooks()
+            # for param in self.temporal_supervisor.parameters():
+            #     print('before backprop', param._forward_counter)
+            #     break
+            (100 * torch.sqrt(errG_supervised)).backward(retain_graph=True)
+            self.temporal_supervisor.disable_hooks()
+            # for param in self.temporal_supervisor.parameters():
+            #     print('after backprop', param._forward_counter)
+            #     break
         # Calculate gradients for G
         G_loss.backward()
 
-        if self.dp_enabled:
-            for _, p in trainable_parameters(self.temporal_recovery):
-                promote_current_grad_sample(p)
-            for _, p in trainable_parameters(self.temporal_supervisor):
-                promote_current_grad_sample(p)
-        # Update G
         for model in train_models:
             if self.clipping_value > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.clipping_value)
@@ -768,7 +796,7 @@ class TimeSeriesGAN(nn.Module):
             horizons_d_fake,
             horizons_d_real,
         ) = self._train_epoch_all_models(
-            static_data, temporal_data, observation_times, cond
+            static_data, temporal_data, observation_times, cond, discriminator_flag=True
         )
 
         real_labels = torch.ones(len(temporal_data)).to(self.device).squeeze()
@@ -787,19 +815,10 @@ class TimeSeriesGAN(nn.Module):
                 + errD_horizon_real
                 + self.gamma_penalty * errD_fake_e
             )
-            self.discriminator.disable_hooks()
             errD.backward(retain_graph=True)
             self.discriminator.enable_hooks()
             errD_real.backward()
-            # Adjustment to the gradients because opacus is not working
-            for _, p in trainable_parameters(self.discriminator):
-                promote_current_grad_sample(p)
-            # for module in self.discriminator.modules():
-            #     if hasattr(module, "activations"):
-            #         # print(len(module.activations))
-            #         module.activations = []
-            # if hasattr(module, "max_batch_len"):
-            #     del module.max_batch_len
+            self.discriminator.disable_hooks()
         else:
             errD = (
                 errD_real
@@ -826,35 +845,11 @@ class TimeSeriesGAN(nn.Module):
         E_losses = []
         G_losses = []
         D_losses = []
-        # self.privacy_engine = PrivacyEngine()
-        # self.temporal_embedder, self.temporal_embedder.optimizer, loader = self.privacy_engine.make_private(
-        #     module=self.temporal_embedder,
-        #     optimizer=self.temporal_embedder.optimizer,
-        #     data_loader=loader,
-        #     noise_multiplier=1.1,
-        #     max_grad_norm=1.0,
-        # )
-        # self.temporal_recovery, self.temporal_recovery.optimizer, loader = self.privacy_engine.make_private(
-        #     module=self.temporal_recovery,
-        #     optimizer=self.temporal_recovery.optimizer,
-        #     data_loader=loader,
-        #     noise_multiplier=1.1,
-        #     max_grad_norm=1.0,
-        # )
-        # self.temporal_supervisor, self.temporal_supervisor.optimizer, loader = self.privacy_engine.make_private(
-        #     module=self.temporal_supervisor,
-        #     optimizer=self.temporal_supervisor.optimizer,
-        #     data_loader=loader,
-        #     noise_multiplier=1.1,
-        #     max_grad_norm=1.0,
-        # )
-        # self.discriminator, self.discriminator.optimizer, loader = self.privacy_engine.make_private(
-        #     module=self.discriminator,
-        #     optimizer=self.discriminator.optimizer,
-        #     data_loader=loader,
-        #     noise_multiplier=1.1,
-        #     max_grad_norm=1.0,
-        # )
+        if self.dp_enabled:
+            self.discriminator.disable_hooks()
+            self.temporal_embedder.disable_hooks()
+            self.temporal_recovery.disable_hooks()
+            self.temporal_supervisor.disable_hooks()
         for i, data in enumerate(loader):
             cond: Optional[torch.Tensor] = None
             if self.n_units_conditional > 0:
@@ -923,21 +918,21 @@ class TimeSeriesGAN(nn.Module):
                     target_delta=self.dp_delta,
                     max_grad_norm=self.dp_max_grad_norm,
                     poisson_sampling=False,
-            )
-            # (
-            #     self.temporal_embedder,
-            #     self.temporal_embedder.optimizer,
-            #     loader,
-            # ) = privacy_engine.make_private_with_epsilon(
-            #         module=self.temporal_embedder,
-            #         optimizer=self.temporal_embedder.optimizer,
-            #         data_loader=loader,
-            #         epochs=self.generator_n_iter,
-            #         target_epsilon=self.dp_epsilon,
-            #         target_delta=self.dp_delta,
-            #         max_grad_norm=self.dp_max_grad_norm,
-            #         poisson_sampling=False,
-            #     )
+                )
+            (
+                self.temporal_embedder,
+                self.temporal_embedder.optimizer,
+                loader,
+            ) = privacy_engine.make_private_with_epsilon(
+                    module=self.temporal_embedder,
+                    optimizer=self.temporal_embedder.optimizer,
+                    data_loader=loader,
+                    epochs=self.generator_n_iter,
+                    target_epsilon=self.dp_epsilon,
+                    target_delta=self.dp_delta,
+                    max_grad_norm=self.dp_max_grad_norm,
+                    poisson_sampling=False,
+                )
             (
                 self.temporal_recovery,
                 self.temporal_recovery.optimizer,
