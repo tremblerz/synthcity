@@ -739,26 +739,21 @@ class TimeSeriesGAN(nn.Module):
         errG_l1_mean = nn.L1Loss()(fake_temporal_data_mean, temporal_mean)
         errG_l1_moments = errG_l1_var + errG_l1_mean
 
-        # 4. Summation
         G_loss = (
             errG_discrimination
             + errG_discrimination_horizons
             + self.gamma_penalty * errG_discrimination_latent
-            + 100 * torch.sqrt(errG_supervised)
             + self.moments_penalty * errG_l1_moments
         )
-
-        if self.dp_enabled:
+        supervised_loss = 100 * torch.sqrt(errG_supervised)
+        if not self.dp_enabled:
+            # 4. Summation
+            G_loss += supervised_loss
+        else:
+            # Calculate gradients for G
             self.temporal_supervisor.enable_hooks()
-            # for param in self.temporal_supervisor.parameters():
-            #     print('before backprop', param._forward_counter)
-            #     break
-            (100 * torch.sqrt(errG_supervised)).backward(retain_graph=True)
+            supervised_loss.backward(retain_graph=True)
             self.temporal_supervisor.disable_hooks()
-            # for param in self.temporal_supervisor.parameters():
-            #     print('after backprop', param._forward_counter)
-            #     break
-        # Calculate gradients for G
         G_loss.backward()
 
         for model in train_models:
